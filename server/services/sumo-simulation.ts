@@ -104,6 +104,11 @@ export class RealTrafficSimulation {
       averageSpeed: Math.round(averageSpeed * 10) / 10
     };
 
+    // Debug log every 60 seconds to avoid spam
+    if (currentTime % 60 === 0) {
+      console.log(`[LIVE DATA] t=${currentTime}s: ${vehiclePositions.length} vehicles, avg speed: ${liveData.averageSpeed}km/h`);
+    }
+
     this.liveDataCallback(liveData);
   }
 

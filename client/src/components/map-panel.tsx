@@ -199,7 +199,7 @@ export default function MapPanel({ onMarkersChange, liveData, showVehicles }: Ma
             onClick={() => handleToolSelect('construction')}
           >
             <HardHat className="h-4 w-4" />
-            Construction Zone
+            建設現場
           </Button>
           <Button
             variant={currentTool === 'facility' ? 'default' : 'outline'}
@@ -212,7 +212,7 @@ export default function MapPanel({ onMarkersChange, liveData, showVehicles }: Ma
             onClick={() => handleToolSelect('facility')}
           >
             <Building className="h-4 w-4" />
-            New Facility
+            施設
           </Button>
           <Button
             variant="outline"

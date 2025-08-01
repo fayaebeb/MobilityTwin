@@ -3,9 +3,8 @@ import type { SimulationMetrics, RiskItem, Recommendation } from "@shared/schema
 import dotenv from "dotenv";
 dotenv.config();
 
-// the newest OpenAI model is "gpt-4o" which was released May 13, 2024. do not change this unless explicitly requested by the user
 const openai = new OpenAI({ 
-  apiKey: process.env.OPENAI_API_KEY
+  apiKey: process.env.OPENAI_API_KEY,
 });
 
 export async function generateTrafficAnalysis(
@@ -20,7 +19,7 @@ export async function generateTrafficAnalysis(
     const hasConstruction = markers.some(m => m.type === 'construction');
     const hasFacility = markers.some(m => m.type === 'facility');
     
-    const prompt = `You are a japanese traffic impact analysis expert. Analyze the following traffic simulation data and provide a comprehensive assessment in japanese.
+    const prompt = `You are a traffic impact analysis expert. Analyze the following traffic simulation data and provide a comprehensive assessment in japanese.
 
 Markers placed:
 ${markers.map(m => `- ${m.type} at coordinates (${m.coordinates.lng.toFixed(4)}, ${m.coordinates.lat.toFixed(4)})`).join('\n')}
