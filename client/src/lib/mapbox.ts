@@ -1,6 +1,4 @@
 import mapboxgl from 'mapbox-gl';
-import dotenv from "dotenv";
-dotenv.config();
 
 // Configure Mapbox
 mapboxgl.accessToken = import.meta.env.VITE_MAPBOX_ACCESS_TOKEN;
