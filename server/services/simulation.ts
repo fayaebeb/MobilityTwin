@@ -45,7 +45,7 @@ export async function runTrafficSimulation(
     log('🚦 Running microsimulation...');
     const simulation = new RealTrafficSimulation(networkData, trafficData, populationData);
 
-    const results = await simulation.simulate(markers, durationMinutes, log); // pass log function if simulate supports it
+    const results = await simulation.simulate(markers, durationMinutes);
 
     results.roads_count = networkData.roads.length;
     results.nodes_count = networkData.nodes.length;

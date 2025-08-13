@@ -2,15 +2,17 @@ import { NetworkData, OSMRoad, getRoadCapacity, getFreeFlowSpeed } from './osm-n
 import { TrafficData } from './tomtom-traffic';
 import { PopulationData } from './population-data';
 import type { SimulationMetrics } from '@shared/schema';
-import { densify } from '../utils/densifyRoute'; 
+import { densify } from '../utils/densifyRoute';
 import { lineString } from '@turf/helpers';
+import type { Position } from 'geojson';
 import along from '@turf/along';
 import length from '@turf/length';
+import bearing from '@turf/bearing';
 import type { LineString } from 'geojson';
 
 export interface SUMOVehicle {
   id: string;
-  route: string[];
+  route: string[];                   // edge IDs
   departTime: number;
   arrivalTime?: number;
   speed: number;
@@ -18,12 +20,12 @@ export interface SUMOVehicle {
   position?: [number, number];
   heading?: number;
   routeProgress?: number;
-  routeCoordinates?: [number, number][];
-  distanceTraveled?: number; // Total distance traveled in meters
-  currentEdgeProgress?: number; // Progress along current edge (0-1)
-  totalRouteLength?: number;
-  line?: LineString;     
-  lineLength?: number;
+  routeCoordinates?: [number, number][]; // polyline coordinates
+  distanceTraveled?: number;        // meters
+  currentEdgeProgress?: number;     // 0-1
+  totalRouteLength?: number;        // meters
+  line?: LineString;
+  lineLength?: number;              // kilometers (turf length)
 }
 
 export interface SUMOEdge {
@@ -32,7 +34,7 @@ export interface SUMOEdge {
   to: string;
   lanes: number;
   speed: number;
-  length: number;
+  length: number;  // meters
   capacity: number;
 }
 
@@ -104,7 +106,6 @@ export class RealTrafficSimulation {
       averageSpeed: Math.round(averageSpeed * 10) / 10
     };
 
-    // Debug log every 60 seconds to avoid spam
     if (currentTime % 60 === 0) {
       console.log(`[LIVE DATA] t=${currentTime}s: ${vehiclePositions.length} vehicles, avg speed: ${liveData.averageSpeed}km/h`);
     }
@@ -115,9 +116,8 @@ export class RealTrafficSimulation {
   private getActiveVehiclePositions(currentTime: number) {
     const activeVehicles = this.vehicles
       .filter(vehicle => vehicle.departTime <= currentTime && !vehicle.arrivalTime)
-      .slice(0, 50); // Limit to 50 vehicles for performance
+      .slice(0, 50);
 
-    // Debug: Log vehicle position accuracy for first few vehicles every 10 steps
     if (this.debug && currentTime % 100 === 0 && activeVehicles.length > 0) {
       console.log(`\n=== Position Accuracy Check (t=${currentTime}s) ===`);
       activeVehicles.slice(0, 3).forEach(vehicle => {
@@ -129,83 +129,76 @@ export class RealTrafficSimulation {
     }
 
     return activeVehicles.map(vehicle => {
-        // Handle vehicles with both full route geometry and single-edge routes
-        if (vehicle.routeCoordinates && vehicle.routeCoordinates.length >= 2 && vehicle.totalRouteLength && vehicle.totalRouteLength > 0) {
-          // Use full route geometry for multi-edge routes
-          const routeProgress = Math.min(1, (vehicle.distanceTraveled || 0) / vehicle.totalRouteLength);
+      // Multi-edge route with full geometry
+      if (vehicle.routeCoordinates && vehicle.routeCoordinates.length >= 2 && vehicle.totalRouteLength && vehicle.totalRouteLength > 0) {
+        const routeProgress = Math.min(1, (vehicle.distanceTraveled || 0) / vehicle.totalRouteLength);
+        const position = this.interpolatePosition(vehicle, routeProgress);
+        const heading = this.calculateHeading(vehicle, routeProgress);
 
-          // Use full route geometry for smooth interpolation
-          //const routeGeometry = vehicle.routeCoordinates.map(([lng, lat]) => ({ lat, lng }));
-          const position = this.interpolatePosition(vehicle, routeProgress);
-          const heading = this.calculateHeading(vehicle, routeProgress);
+        vehicle.routeProgress = routeProgress;
 
-          // Store route progress for debugging
-          vehicle.routeProgress = routeProgress;
+        return {
+          id: vehicle.id,
+          coordinates: position as [number, number],
+          speed: vehicle.speed,
+          heading,
+          routeProgress,
+          distanceTraveled: vehicle.distanceTraveled || 0,
+          // keep 'route' for backward compatibility as coordinates
+          route: vehicle.routeCoordinates,
+          // provide explicit fields
+          routeCoordinates: vehicle.routeCoordinates,
+          edgeIds: vehicle.route
+        };
+      }
 
-          return {
-            id: vehicle.id,
-            coordinates: position,
-            speed: vehicle.speed,
-            heading,
-            routeProgress,
-            distanceTraveled: vehicle.distanceTraveled || 0,
-            route: vehicle.routeCoordinates
-          };
-        } else {
-          // Fallback to single-edge positioning for short routes
-          const currentEdgeId = vehicle.route[0];
-          const road = this.network.roads.find(r => r.id === currentEdgeId);
+      // Single-edge fallback
+      const currentEdgeId = vehicle.route[0];
+      const road = this.network.roads.find(r => r.id === currentEdgeId);
+      if (!road || road.geometry.length === 0) {
+        return null;
+      }
 
-          if (!road || road.geometry.length === 0) {
-            return null;
-          }
+      const coords = road.geometry.map(p => [p.lng, p.lat] as [number, number]);
+      const line = lineString(coords);
+      const totalKm = length(line, { units: 'kilometers' });
 
-const coords = road.geometry.map(p => [p.lng, p.lat] as [number, number]);
-const line = lineString(coords);
-const totalLength = length(line, { units: 'kilometers' });
+      const routeProgress = Math.min(1, vehicle.currentEdgeProgress || 0);
+      const point = along(line, totalKm * routeProgress, { units: 'kilometers' });
+      const nextPoint = along(line, totalKm * Math.min(routeProgress + 0.001, 1), { units: 'kilometers' });
 
-const routeProgress = vehicle.currentEdgeProgress || 0;
-const point = along(line, totalLength * routeProgress, { units: 'kilometers' });
-const nextPoint = along(line, totalLength * Math.min(routeProgress + 0.001, 1), { units: 'kilometers' });
+      const position = point.geometry.coordinates as [number, number];
+      const head = bearing(point.geometry.coordinates as Position, nextPoint.geometry.coordinates as Position);
 
-const deltaLng = nextPoint.geometry.coordinates[0] - point.geometry.coordinates[0];
-const deltaLat = nextPoint.geometry.coordinates[1] - point.geometry.coordinates[1];
+      vehicle.routeProgress = routeProgress;
 
-const position: [number, number] = point.geometry.coordinates as [number, number];
-const heading = Math.atan2(deltaLng, deltaLat) * 180 / Math.PI;
-
-
-
-          // Store route progress for debugging
-          vehicle.routeProgress = routeProgress;
-
-          return {
-            id: vehicle.id,
-            coordinates: position,
-            speed: vehicle.speed,
-            heading,
-            routeProgress,
-            distanceTraveled: vehicle.distanceTraveled || 0,
-            route: road.geometry.map(point => [point.lng, point.lat] as [number, number])
-          };
-        }
-      })
-      .filter(Boolean);
+      return {
+        id: vehicle.id,
+        coordinates: position,
+        speed: vehicle.speed,
+        heading: head,
+        routeProgress,
+        distanceTraveled: vehicle.distanceTraveled || 0,
+        // keep 'route' for backward compatibility as coordinates
+        route: coords,
+        // provide explicit fields
+        routeCoordinates: coords,
+        edgeIds: vehicle.route
+      };
+    })
+    .filter(Boolean);
   }
 
   private getCongestionSegments() {
-    const congestionSegments = [];
+    const congestionSegments: Array<{coordinates: [number, number][], level: 'high' | 'medium' | 'low'}> = [];
 
     for (const edge of this.edges) {
       const road = this.network.roads.find(r => r.id === edge.id);
       if (!road || road.geometry.length === 0) continue;
 
-      // Count active vehicles on this edge
-      const vehicleCount = this.vehicles.filter(vehicle => 
-        vehicle.route[0] === edge.id && 
-        vehicle.departTime <= this.simulationTime && 
-        !vehicle.arrivalTime
-      ).length;
+      const vehicleCount = this.vehicles.reduce((acc, vehicle) =>
+        (vehicle.route[0] === edge.id && vehicle.departTime <= this.simulationTime && !vehicle.arrivalTime) ? acc + 1 : acc
+      , 0);
 
       const utilization = vehicleCount / Math.max(1, edge.capacity / 3600);
 
@@ -222,30 +215,23 @@ const heading = Math.atan2(deltaLng, deltaLat) * 180 / Math.PI;
       }
     }
 
-    return congestionSegments.slice(0, 20); // Limit for performance
+    return congestionSegments.slice(0, 20);
   }
 
   private interpolatePosition(vehicle: SUMOVehicle, progress: number): [number, number] {
-  if (!vehicle.line || !vehicle.lineLength || vehicle.lineLength === 0) {
-  return vehicle.routeCoordinates?.[0] ?? [0, 0]; // fallback to first point or dummy
-}
-  const point = along(vehicle.line, vehicle.lineLength * progress, { units: 'kilometers' });
-  return point.geometry.coordinates as [number, number];
-}
-
-
+    if (!vehicle.line || !vehicle.lineLength || vehicle.lineLength === 0) {
+      return vehicle.routeCoordinates?.[0] ?? [0, 0];
+    }
+    const point = along(vehicle.line, vehicle.lineLength * progress, { units: 'kilometers' });
+    return point.geometry.coordinates as [number, number];
+  }
 
   private calculateHeading(vehicle: SUMOVehicle, progress: number): number {
-  if (!vehicle.line || !vehicle.lineLength) return 0;
-
-  const p1 = along(vehicle.line, vehicle.lineLength * progress, { units: 'kilometers' }).geometry.coordinates;
-  const p2 = along(vehicle.line, vehicle.lineLength * Math.min(progress + 0.001, 1), { units: 'kilometers' }).geometry.coordinates;
-
-  const deltaLng = p2[0] - p1[0];
-  const deltaLat = p2[1] - p1[1];
-
-  return Math.atan2(deltaLng, deltaLat) * 180 / Math.PI;
-}
+    if (!vehicle.line || !vehicle.lineLength) return 0;
+    const p1 = along(vehicle.line, vehicle.lineLength * progress, { units: 'kilometers' }).geometry.coordinates as Position;
+    const p2 = along(vehicle.line, vehicle.lineLength * Math.min(progress + 0.001, 1), { units: 'kilometers' }).geometry.coordinates as Position;
+    return bearing(p1, p2);
+  }
 
   public getConstructionImpacts() {
     return this.constructionLogs;
@@ -264,28 +250,16 @@ const heading = Math.atan2(deltaLng, deltaLat) * 180 / Math.PI;
     this.simulationTime = 0;
   }
 
-  /**
-   * Run complete traffic simulation with construction/facility impacts
-   */
   async simulate(
     markers: Array<{ type: string; coordinates: { lng: number; lat: number } }>,
     simulationDurationMinutes: number = 60
   ): Promise<SimulationMetrics> {
     console.log('Starting advanced traffic simulation...');
 
-    // 1. Apply marker impacts to road network
     this.applyMarkerImpacts(markers);
-
-    // 2. Generate realistic vehicle demand based on population
     const vehicleDemand = this.generateVehicleDemand();
-
-    // 3. Create vehicle routes and departure times
     this.generateVehicleTrips(vehicleDemand);
-
-    // 4. Run microsimulation
     const finalState = this.runMicrosimulation(simulationDurationMinutes);
-
-    // 5. Calculate metrics
     return this.calculateMetrics(finalState);
   }
 
@@ -299,7 +273,7 @@ const heading = Math.atan2(deltaLng, deltaLat) * 180 / Math.PI;
       const lanes = parseInt(road.tags.lanes || '1');
       const maxSpeed = getFreeFlowSpeed(highway);
       const capacity = getRoadCapacity(highway) * lanes;
-      const length = this.calculateRoadLength(road.geometry);
+      const lengthM = this.calculateRoadLength(road.geometry);
 
       const edge: SUMOEdge = {
         id: road.id,
@@ -307,7 +281,7 @@ const heading = Math.atan2(deltaLng, deltaLat) * 180 / Math.PI;
         to: road.nodes[road.nodes.length - 1].toString(),
         lanes,
         speed: maxSpeed,
-        length,
+        length: lengthM,
         capacity
       };
 
@@ -324,10 +298,8 @@ const heading = Math.atan2(deltaLng, deltaLat) * 180 / Math.PI;
     return edges;
   }
 
-    private applyMarkerImpacts(markers: Array<{ type: string; coordinates: { lng: number; lat: number } }>) {
-    // Track which edges have been affected to avoid multiple impacts
+  private applyMarkerImpacts(markers: Array<{ type: string; coordinates: { lng: number; lat: number } }>) {
     const affectedEdges = new Set<string>();
-    // Track processed facilities to avoid duplicate traffic generation
     const processedFacilities = new Set<string>();
 
     markers.forEach((marker) => {
@@ -335,18 +307,15 @@ const heading = Math.atan2(deltaLng, deltaLat) * 180 / Math.PI;
 
       if (marker.type === 'construction') {
         nearbyEdges.forEach((edge) => {
-          // Only apply construction impact once per edge
           if (!affectedEdges.has(edge.id)) {
             const originalSpeed = edge.speed;
 
-            // Construction zone impacts - more conservative
-            edge.speed = Math.max(5, originalSpeed * 0.4); // Reduce speed to 40%, minimum 5 km/h
-            edge.capacity = Math.max(50, edge.capacity * 0.6); // Reduce capacity to 60%, minimum 50
+            edge.speed = Math.max(5, originalSpeed * 0.4);
+            edge.capacity = Math.max(50, edge.capacity * 0.6);
 
-            // Rarely close roads completely (5% chance)
             if (Math.random() < 0.05) {
-              edge.capacity = 10; // Very low but not zero
-              edge.speed = 5; // Very slow but not stopped
+              edge.capacity = 10;
+              edge.speed = 5;
             }
 
             this.constructionLogs.push({
@@ -360,11 +329,8 @@ const heading = Math.atan2(deltaLng, deltaLat) * 180 / Math.PI;
           }
         });
       } else if (marker.type === 'facility') {
-        // Create unique key for facility location to prevent duplicate processing
         const facilityKey = `${marker.coordinates.lng.toFixed(6)},${marker.coordinates.lat.toFixed(6)}`;
-
         if (!processedFacilities.has(facilityKey)) {
-          // New facility increases local traffic demand
           const nearbyDemand = this.calculateFacilityTrafficGeneration(marker.coordinates);
           this.addFacilityTraffic(marker.coordinates, nearbyDemand);
           processedFacilities.add(facilityKey);
@@ -373,19 +339,16 @@ const heading = Math.atan2(deltaLng, deltaLat) * 180 / Math.PI;
     });
 
     console.log(`Applied impacts from ${markers.length} markers to road network (${affectedEdges.size} edges affected, ${processedFacilities.size} facilities processed)`);
-      this.affectedEdgesSet = affectedEdges;
+    this.affectedEdgesSet = affectedEdges;
   }
 
   private generateVehicleDemand(): number {
-    // Calculate vehicle demand based on population and peak hour factor
     const baseVehicles = this.populationData.estimatedVehicles * this.populationData.peakHourFactor;
 
-    // Apply traffic data multiplier
     const trafficMultiplier = this.trafficData.congestionLevel === 'SEVERE' ? 1.3 :
-                            this.trafficData.congestionLevel === 'HIGH' ? 1.2 :
-                            this.trafficData.congestionLevel === 'MEDIUM' ? 1.1 : 1.0;
+                              this.trafficData.congestionLevel === 'HIGH' ? 1.2 :
+                              this.trafficData.congestionLevel === 'MEDIUM' ? 1.1 : 1.0;
 
-    // Cap vehicle count for performance (max 500 vehicles for live simulation)
     const rawDemand = Math.round(baseVehicles * trafficMultiplier);
     const totalDemand = Math.min(rawDemand, 500);
 
@@ -397,77 +360,62 @@ const heading = Math.atan2(deltaLng, deltaLat) * 180 / Math.PI;
     this.vehicles = [];
 
     for (let i = 0; i < vehicleCount; i++) {
-      // Spread departures over first 40 minutes for realistic continuous flow
       const departTime = Math.random() * 2400;
 
-      // Select random origin and far destination
       const originEdge = this.edges[Math.floor(Math.random() * this.edges.length)];
       const destEdge = this.pickFarEdge(originEdge);
 
-      // Build route
       let route = [originEdge.id];
       if (originEdge.id !== destEdge.id) {
         const fullRoute = this.findSimpleRoute(originEdge.id, destEdge.id);
         route = fullRoute.length > 0 ? fullRoute : [originEdge.id];
       }
 
-      // Build geometry and total route length
       const routeCoordinates: [number, number][] = [];
       let totalRouteLength = 0;
 
       for (const edgeId of route) {
         const road = this.network.roads.find(r => r.id === edgeId);
         if (road && road.geometry.length > 1) {
-          const rawCoords = road.geometry.map(pt => [pt.lng, pt.lat] as [number, number]); 
-          const coords = densify(rawCoords, 5); // densify every 5 meters
-          //const coords = rawCoords;
-
-          if (routeCoordinates.length > 0) {
-            coords.shift(); // avoid overlap
-          }
-
+          const rawCoords = road.geometry.map(pt => [pt.lng, pt.lat] as [number, number]);
+          const coords = densify(rawCoords, 5);
+          if (routeCoordinates.length > 0) coords.shift();
           routeCoordinates.push(...coords);
 
-const edge = this.edgeMap.get(edgeId);
-if (edge) {
-  totalRouteLength += edge.length;
-}
-
+          const edge = this.edgeMap.get(edgeId);
+          if (edge) {
+            totalRouteLength += edge.length;
+          }
         }
       }
 
-      // Skip very short routes (trivial trips under 200m)
       if (totalRouteLength < 200) continue;
 
-      // Initialize realistic speed
       const initialSpeed = originEdge ? Math.max(15, originEdge.speed * (0.6 + Math.random() * 0.4)) : 25;
       const lineFeature = lineString(routeCoordinates);
-const line = lineFeature.geometry;
-const lineLength = length(lineFeature, { units: 'kilometers' });
-
+      const line = lineFeature.geometry;
+      const lineLength = length(lineFeature, { units: 'kilometers' });
 
       this.vehicles.push({
         id: `vehicle_${i}`,
-       route,
-  departTime,
-  speed: initialSpeed,
-  emissions: 0,
-  distanceTraveled: 0,
-  currentEdgeProgress: 0,
-  routeCoordinates,
-  routeProgress: 0,
-  totalRouteLength,
-  line,
-  lineLength 
+        route,
+        departTime,
+        speed: initialSpeed,
+        emissions: 0,
+        distanceTraveled: 0,
+        currentEdgeProgress: 0,
+        routeCoordinates,
+        routeProgress: 0,
+        totalRouteLength,
+        line,
+        lineLength
       });
     }
 
-    // Sanity check: print expected average route length
-    const avgLen = this.vehicles.reduce((s,v)=>s+(v.totalRouteLength||0),0)/this.vehicles.length;
+    const avgLen = this.vehicles.reduce((s,v)=>s+(v.totalRouteLength||0),0)/Math.max(1,this.vehicles.length);
     console.log(`Created ${this.vehicles.length} vehicle trips`);
     console.log(`Avg planned route = ${(avgLen/1000).toFixed(2)} km`);
 
-    // Debug preview
     if (this.vehicles.length > 0) {
       console.log(`  Sample vehicles:`)
       for (let i = 0; i < Math.min(3, this.vehicles.length); i++) {
@@ -490,31 +438,19 @@ const lineLength = length(lineFeature, { units: 'kilometers' });
 
     console.log(`Starting ${durationMinutes} minute microsimulation with ${this.vehicles.length} vehicles...`);
 
-    // Use larger time steps for faster simulation
-    const timeStep = 10; // 10 second steps instead of 1 second
-
     while (t < maxTime) {
       this.simulationTime = t;
       let currentActiveVehicles = 0;
 
-      // Count active vehicles first
       for (const vehicle of this.vehicles) {
-        if (vehicle.departTime <= t && !vehicle.arrivalTime) {
-          currentActiveVehicles++;
-        }
+        if (vehicle.departTime <= t && !vehicle.arrivalTime) currentActiveVehicles++;
       }
 
-      const step = currentActiveVehicles > 100 ? 1 : 10; // Now calculate step size with correct count
+      const step = currentActiveVehicles > 100 ? 1 : 10;
 
       for (const vehicle of this.vehicles) {
         if (vehicle.departTime <= t && !vehicle.arrivalTime) {
-          this.updateVehicle(vehicle, t, step); // Pass step to updateVehicle
-
-          // Calculate distance for this time step based on current speed
-          const distanceThisStep = (vehicle.speed * step) / 3600; // km
-          totalDistance = this.vehicles.reduce((sum, v) => sum + (v.distanceTraveled || 0), 0) / 1000; // Convert to km
-
-          //totalDistance += distanceThisStep;
+          this.updateVehicle(vehicle, t, step);
 
           if (t % 10 === 0) {
             totalEmissions += this.calculateVehicleEmissions(vehicle);
@@ -526,18 +462,18 @@ const lineLength = length(lineFeature, { units: 'kilometers' });
       }
 
       activeVehicleCount = Math.max(activeVehicleCount, currentActiveVehicles);
+      totalDistance = this.vehicles.reduce((sum, v) => sum + (v.distanceTraveled || 0), 0) / 1000;
 
       if (t % 300 === 0) {
         congestionLength += this.calculateCongestionLength();
       }
 
-      // Send live data every 5 seconds
       if (this.liveDataCallback && t % 10 === 0) {
         this.sendLiveData(t, currentActiveVehicles, speedSum / Math.max(speedCount, 1));
       }
 
       if (t > 0 && t % 600 === 0) {
-        const avgVehicleDistance = this.vehicles.reduce((sum, v) => sum + (v.distanceTraveled || 0), 0) / this.vehicles.length / 1000; // Convert to km
+        const avgVehicleDistance = this.vehicles.reduce((sum, v) => sum + (v.distanceTraveled || 0), 0) / Math.max(1,this.vehicles.length) / 1000;
         console.log(`  Time ${Math.round(t/60)}min: ${currentActiveVehicles} active vehicles, ${Math.round(totalDistance)}km total, ${avgVehicleDistance.toFixed(1)}km avg per vehicle`);
       }
 
@@ -561,7 +497,6 @@ const lineLength = length(lineFeature, { units: 'kilometers' });
     const edge = this.edgeMap.get(currentEdgeId);
     if (!edge) return;
 
-    // Traffic flow impact from real-time data
     const trafficFlow = this.trafficData.flows.find(f =>
       this.isNearEdge(f.coordinates, edge)
     );
@@ -571,7 +506,6 @@ const lineLength = length(lineFeature, { units: 'kilometers' });
       targetSpeed = Math.min(edge.speed, trafficFlow.currentSpeed);
     }
 
-    // Count vehicles on current edge (faster than .filter())
     const edgeVehicles = this.vehicles.reduce((count, v) =>
       (v.route[0] === currentEdgeId && v.departTime <= currentTime && !v.arrivalTime) ? count + 1 : count
     , 0);
@@ -582,34 +516,21 @@ const lineLength = length(lineFeature, { units: 'kilometers' });
       targetSpeed *= congestionFactor;
     }
 
-    // Smooth speed adjustment
     const speedDiff = targetSpeed - vehicle.speed;
     vehicle.speed += speedDiff * 0.2;
     vehicle.speed = Math.max(0, vehicle.speed);
-
     if (targetSpeed > 0 && vehicle.speed < 5) {
       vehicle.speed = Math.max(5, targetSpeed * 0.3);
     }
 
-    // Initialize distance tracking if not set
-    if (vehicle.distanceTraveled === undefined) {
-      vehicle.distanceTraveled = 0;
-    }
-    if (vehicle.currentEdgeProgress === undefined) {
-      vehicle.currentEdgeProgress = 0;
-    }
+    if (vehicle.distanceTraveled === undefined) vehicle.distanceTraveled = 0;
+    if (vehicle.currentEdgeProgress === undefined) vehicle.currentEdgeProgress = 0;
 
-    // Calculate distance traveled in this time step if vehicle is moving
     if (vehicle.speed > 0) {
-      // Distance in meters = speed (km/h) * timeStep (seconds) / 3.6
-      const distanceThisStep = (vehicle.speed * timeStep) / 3.6;
-
-      // Update progress along current edge
+      const distanceThisStep = (vehicle.speed * timeStep) / 3.6; // meters
       if (edge && edge.length > 0) {
         const remainingEdgeDistance = edge.length * (1 - vehicle.currentEdgeProgress);
-
         if (distanceThisStep >= remainingEdgeDistance) {
-          // Vehicle completes current edge and moves to next
           vehicle.distanceTraveled += remainingEdgeDistance;
           vehicle.route.shift();
           vehicle.currentEdgeProgress = 0;
@@ -617,7 +538,6 @@ const lineLength = length(lineFeature, { units: 'kilometers' });
           if (vehicle.route.length === 0) {
             vehicle.arrivalTime = currentTime;
           } else {
-            // Continue with remaining distance on next edge
             const remainingDistance = distanceThisStep - remainingEdgeDistance;
             const nextEdge = this.edgeMap.get(vehicle.route[0]);
             if (nextEdge && nextEdge.length > 0) {
@@ -625,7 +545,6 @@ const lineLength = length(lineFeature, { units: 'kilometers' });
             }
           }
         } else {
-          // Vehicle continues on current edge
           vehicle.distanceTraveled += distanceThisStep;
           vehicle.currentEdgeProgress += distanceThisStep / edge.length;
           vehicle.currentEdgeProgress = Math.min(0.95, vehicle.currentEdgeProgress);
@@ -633,14 +552,12 @@ const lineLength = length(lineFeature, { units: 'kilometers' });
       }
     }
 
-    // Optional: debug vehicle stuck
     if (this.debug && currentTime < 100 && vehicle.speed === 0) {
       console.log(`Debug: Vehicle ${vehicle.id} stuck. Target=${targetSpeed.toFixed(1)} km/h, Edge=${edge.id}, Cap=${edge.capacity}, RouteLen=${vehicle.route.length}`);
     }
   }
 
   private calculateMetrics(finalState: SimulationState): SimulationMetrics {
-    // Apply realistic variance
     const variance = (Math.random() - 0.5) * 0.1;
 
     const totalDistance = Math.round(finalState.totalDistance * (1 + variance));
@@ -656,26 +573,25 @@ const lineLength = length(lineFeature, { units: 'kilometers' });
     };
   }
 
-  // Helper methods
+  // Helpers
   private calculateRoadLength(geometry: Array<{ lat: number; lng: number }>): number {
-    let length = 0;
+    let lengthM = 0;
     for (let i = 1; i < geometry.length; i++) {
-      length += this.haversineDistance(geometry[i-1], geometry[i]);
+      lengthM += this.haversineDistance(geometry[i-1], geometry[i]);
     }
-    return length;
+    return lengthM;
   }
 
   private haversineDistance(coord1: { lat: number; lng: number }, coord2: { lat: number; lng: number }): number {
-    const R = 6371000; // Earth's radius in meters
+    const R = 6371000;
     const lat1Rad = coord1.lat * Math.PI / 180;
     const lat2Rad = coord2.lat * Math.PI / 180;
     const deltaLat = (coord2.lat - coord1.lat) * Math.PI / 180;
     const deltaLng = (coord2.lng - coord1.lng) * Math.PI / 180;
 
-    const a = Math.sin(deltaLat/2) * Math.sin(deltaLat/2) +
+    const a = Math.sin(deltaLat/2) ** 2 +
               Math.cos(lat1Rad) * Math.cos(lat2Rad) *
-              Math.sin(deltaLng/2) * Math.sin(deltaLng/2);
-
+              Math.sin(deltaLng/2) ** 2;
     return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
   }
 
@@ -683,78 +599,63 @@ const lineLength = length(lineFeature, { units: 'kilometers' });
     return this.edges.filter(edge => {
       const road = this.network.roads.find(r => r.id === edge.id);
       if (!road || road.geometry.length === 0) return false;
-
       const distance = this.haversineDistance(coordinates, road.geometry[0]);
       return distance <= radiusKm * 1000;
     });
   }
 
-  private calculateFacilityTrafficGeneration(coordinates: { lng: number; lat: number }): number {
-    // Estimate additional traffic generated by new facility
+  private calculateFacilityTrafficGeneration(_coordinates: { lng: number; lat: number }): number {
     const populationInArea = this.populationData.density * 4; // 2km radius area
-    const additionalVehicles = Math.round(populationInArea * 0.05); // 5% additional traffic
-
-    // Cap the number of additional vehicles to prevent performance issues
+    const additionalVehicles = Math.round(populationInArea * 0.05);
     const cappedVehicles = Math.min(additionalVehicles, 100);
-
     console.log(`Facility traffic generation: ${cappedVehicles} vehicles (uncapped: ${additionalVehicles})`);
     return cappedVehicles;
   }
 
   private addFacilityTraffic(coordinates: { lng: number; lat: number }, additionalVehicles: number) {
-    // Find nearby edges once instead of for each vehicle - major performance optimization
     const nearbyEdges = this.findNearbyEdges(coordinates, 0.2);
     if (nearbyEdges.length === 0) return;
 
     console.log(`Adding ${additionalVehicles} facility trips to ${nearbyEdges.length} nearby edges`);
 
-    // Add destination trips to facility location with real routes
     for (let i = 0; i < additionalVehicles; i++) {
-      // Pick a random nearby edge as origin
       const outEdge = nearbyEdges[Math.floor(Math.random() * nearbyEdges.length)];
-      const backEdge = this.pickFarEdge(outEdge, 1000);  // at least 1 km away
+      const backEdge = this.pickFarEdge(outEdge, 1000);
       const facilityRoute = this.findSimpleRoute(outEdge.id, backEdge.id);
 
-      // Build route geometry for facility trips
       const routeCoordinates: [number, number][] = [];
       let totalRouteLength = 0;
 
       for (const edgeId of facilityRoute) {
         const road = this.network.roads.find(r => r.id === edgeId);
         if (road && road.geometry.length > 1) {
-          const rawCoords = road.geometry.map(pt => [pt.lng, pt.lat] as [number, number]); 
-          const coords = densify(rawCoords, 5); // densify every 5 meters
-          //const coords = rawCoords;
-          if (routeCoordinates.length > 0) {
-            coords.shift(); // avoid overlap
-          }
+          const rawCoords = road.geometry.map(pt => [pt.lng, pt.lat] as [number, number]);
+          const coords = densify(rawCoords, 5);
+          if (routeCoordinates.length > 0) coords.shift();
           routeCoordinates.push(...coords);
           const edge = this.edgeMap.get(edgeId);
-          if (edge) {
-            totalRouteLength += edge.length;
-          }
+          if (edge) totalRouteLength += edge.length;
         }
       }
+
       const lineFeature = lineString(routeCoordinates);
-const line = lineFeature.geometry;
-const lineLength = length(lineFeature, { units: 'kilometers' });
-
-
+      const line = lineFeature.geometry;
+      const lineLength = length(lineFeature, { units: 'kilometers' });
 
       this.vehicles.push({
-  id: `facility_trip_${i}`,
-  route: facilityRoute,
-  departTime: Math.random() * 3600,
-  speed: Math.max(10, outEdge.speed * 0.6),
-  emissions: 0,
-  distanceTraveled: 0,
-  currentEdgeProgress: 0,
-  routeCoordinates,
-  routeProgress: 0,
-  totalRouteLength,
-  line,
-  lineLength
-});
+        id: `facility_trip_${i}`,
+        route: facilityRoute,
+        departTime: Math.random() * 3600,
+        speed: Math.max(10, outEdge.speed * 0.6),
+        emissions: 0,
+        distanceTraveled: 0,
+        currentEdgeProgress: 0,
+        routeCoordinates,
+        routeProgress: 0,
+        totalRouteLength,
+        line,
+        lineLength
+      });
     }
   }
 
@@ -766,21 +667,18 @@ const lineLength = length(lineFeature, { units: 'kilometers' });
     const destEdge   = this.edgeMap.get(destEdgeId);
     if (!originEdge || !destEdge) return [originEdgeId];
 
-    const MIN_METERS = 4_000 + Math.random() * 4_000;   // 4–8 km
-    const MAX_STEPS  = 200;                             // allow longer chains
+    const MIN_METERS = 4_000 + Math.random() * 4_000;
+    const MAX_STEPS  = 200;
 
-    const route    : string[] = [originEdgeId];
-    const visited  = new Set<string>([originEdgeId]);
-    let current    = originEdge.to;
-    let cumLength  = originEdge.length;
+    const route   : string[] = [originEdgeId];
+    const visited = new Set<string>([originEdgeId]);
+    let current   = originEdge.to;
+    let cumLength = originEdge.length;
 
     while (cumLength < MIN_METERS && route.length < MAX_STEPS) {
       let nextEdges = this.edgesFromMap.get(current) || [];
-
-      // ❶ allow closed edges; don't filter on capacity
       nextEdges = nextEdges.filter(e => !visited.has(e.id));
 
-      // ❷ escape from dead-ends
       if (nextEdges.length === 0) {
         const jump = this.pickFarEdge(this.edgeMap.get(route.at(-1)!)!, 1_000);
         route.push(jump.id);
@@ -790,7 +688,6 @@ const lineLength = length(lineFeature, { units: 'kilometers' });
         continue;
       }
 
-      // ❸ proceed normally
       const next = nextEdges[Math.floor(Math.random() * nextEdges.length)];
       route.push(next.id);
       visited.add(next.id);
@@ -798,51 +695,39 @@ const lineLength = length(lineFeature, { units: 'kilometers' });
       current = next.to;
     }
 
-    // ❹ always connect to destination
     if (current !== destEdge.from) {
       route.push(destEdgeId);
       cumLength += destEdge.length;
     }
 
-    // ❺ retry once if still too short
     if (cumLength < MIN_METERS) {
-      return this.findSimpleRoute(destEdgeId, originEdgeId); // swapped
+      return this.findSimpleRoute(destEdgeId, originEdgeId);
     }
 
     this.routeCache.set(cacheKey, route);
     return route;
   }
 
-
   private calculateVehicleEmissions(vehicle: SUMOVehicle): number {
-    // CO₂ emissions based on speed and distance (g/km)
     const speed = vehicle.speed;
     if (speed <= 0) return 0;
 
-    let emissionFactor = 120; // g CO₂/km base for typical car
+    let emissionFactor = 120; // g/km
 
-    // Adjust emissions based on speed (real emission curves)
-    if (speed < 20) emissionFactor *= 1.6; // Much higher emissions in stop-and-go traffic
-    else if (speed < 40) emissionFactor *= 1.2; // Higher emissions at low speeds
-    else if (speed > 80) emissionFactor *= 1.3; // Higher emissions at highway speeds
-    else emissionFactor *= 1.0; // Optimal efficiency at 40-80 km/h
+    if (speed < 20) emissionFactor *= 1.6;
+    else if (speed < 40) emissionFactor *= 1.2;
+    else if (speed > 80) emissionFactor *= 1.3;
 
-    // Calculate distance traveled in this time step (1 second)
-    const distanceKm = speed / 3600; // km/h to km/second
-
-    // Total emissions = emission factor × distance
+    const distanceKm = speed / 3600;
     const emissionsGrams = emissionFactor * distanceKm;
-    const emissionsKg = emissionsGrams / 1000; // Convert grams to kg
-
-    return emissionsKg;
+    return emissionsGrams / 1000;
   }
 
   private calculateCongestionLength(): number {
-    // Calculate total length of congested roads
     let congestionLength = 0;
 
     this.edges.forEach(edge => {
-      const vehiclesOnEdge = this.vehicles.filter(v => 
+      const vehiclesOnEdge = this.vehicles.filter(v =>
         v.route[0] === edge.id && v.departTime <= this.simulationTime && !v.arrivalTime
       );
 
@@ -852,7 +737,7 @@ const lineLength = length(lineFeature, { units: 'kilometers' });
       }
     });
 
-    return congestionLength / 1000; // Convert to km
+    return congestionLength / 1000;
   }
 
   private isNearEdge(coordinates: Array<{ lat: number; lng: number }>, edge: SUMOEdge): boolean {
@@ -862,6 +747,6 @@ const lineLength = length(lineFeature, { units: 'kilometers' });
     if (!road || road.geometry.length === 0) return false;
 
     const distance = this.haversineDistance(coordinates[0], road.geometry[0]);
-    return distance < 1000; // Within 1km
+    return distance < 1000; // 1km
   }
 }
